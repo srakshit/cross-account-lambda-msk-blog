@@ -1,0 +1,23 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Add route table entry to route MSK VPC requests through VPC Peering connection
+Parameters:
+  LambdaVPCPrivateRouteTable:
+    Description: Route table associated with private subnets of Lambda VPC
+    Type: String
+  VPCPeeringConnection:
+    Description: VPC Peering Connection Id
+    Type: String
+
+Resources:
+  MSKVPCRouteToVPCPeering:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref LambdaVPCPrivateRouteTable
+      DestinationCidrBlock: 172.31.0.0/16
+      VpcPeeringConnectionId: !Ref VPCPeeringConnection
+
+Outputs:
+  MSKVPCRouteToVPCPeering:
+    Value: !Ref MSKVPCRouteToVPCPeering
+
+

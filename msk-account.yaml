@@ -1,0 +1,499 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create a MSK VPC with MSK Cluster and a VPC Peering connection using the PeerRole to accept.
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  LatestAmiId:
+    Type:  AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  LambdaVPCAccountId:
+    Description: AWS AccountId where Lambda is provisoned
+    Type: String
+  LambdaVPCId:
+    Description: VPC Id where Lambda is provisoned
+    Type: String
+  VPCPeeringRoleARN:
+    Description: Arn of the role used for VPC Peering
+    Type: String
+  LambdaSecurityGroup:
+    Description: Security Group of Lambda function
+    Type: String
+
+Resources:
+  MSKVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.31.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: MSKVPC
+
+  VPCPeeringConnection:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties:
+      VpcId: !Ref MSKVPC
+      PeerVpcId: !Ref LambdaVPCId
+      PeerOwnerId: !Ref LambdaVPCAccountId
+      PeerRoleArn: !Ref VPCPeeringRoleARN
+
+  MSKVPCPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MSKVPC
+      AvailabilityZone:
+        Fn::Select:
+         - 0
+         - Fn::GetAZs: {Ref: "AWS::Region"}
+      CidrBlock: 172.31.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["MSKVPC","public-subnet"]]
+  
+  MSKVPCPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MSKVPC
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: {Ref: "AWS::Region"}
+      CidrBlock: 172.31.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["MSKVPC","private-subnet-a"]]
+  
+  MSKVPCPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MSKVPC
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: "AWS::Region"}
+      CidrBlock: 172.31.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["MSKVPC","private-subnet-b"]]
+  
+  MSKVPCInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["MSKVPC","gateway"]]
+  
+  MSKVPCGatewayToInternet:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MSKVPC
+      InternetGatewayId: !Ref MSKVPCInternetGateway
+  
+  MSKVPCPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MSKVPC
+  
+  MSKVPCPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: MSKVPCGatewayToInternet
+    Properties:
+      RouteTableId: !Ref MSKVPCPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MSKVPCInternetGateway
+  
+  MSKVPCPublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MSKVPCPublicSubnet1
+      RouteTableId: !Ref MSKVPCPublicRouteTable
+  
+  MSKVPCNatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: MSKVPCNatPublicIP
+    Properties:
+      AllocationId: !GetAtt MSKVPCNatPublicIP.AllocationId
+      SubnetId: !Ref MSKVPCPublicSubnet1
+  
+  MSKVPCNatPublicIP:
+    Type: AWS::EC2::EIP
+    DependsOn: MSKVPC
+    Properties:
+      Domain: vpc
+ 
+  MSKVPCPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MSKVPC
+  
+  LambdaVPCRouteToVPCPeering:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref MSKVPCPrivateRouteTable
+      DestinationCidrBlock: 172.16.0.0/16
+      VpcPeeringConnectionId: !Ref VPCPeeringConnection
+
+  MSKVPCPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref MSKVPCPrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref MSKVPCNatGateway
+  
+  MSKVPCPrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MSKVPCPrivateSubnet1
+      RouteTableId: !Ref MSKVPCPrivateRouteTable
+  
+  MSKVPCPrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MSKVPCPrivateSubnet2
+      RouteTableId: !Ref MSKVPCPrivateRouteTable
+  
+  KafkaClientInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22 from BastionHostSecurityGroup
+      VpcId: !Ref MSKVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 172.31.0.0/24
+
+  MSKSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MSK Security Group
+      VpcId: !Ref MSKVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        Description: "Zookeeper access from Kafka Client Instance"
+        FromPort: 2181
+        ToPort: 2181
+        SourceSecurityGroupId: !Ref KafkaClientInstanceSecurityGroup
+      - IpProtocol: tcp
+        Description: "MSK access from Kafka Client Instance while using no Auth"
+        FromPort: 9094
+        ToPort: 9094
+        SourceSecurityGroupId: !Ref KafkaClientInstanceSecurityGroup
+      - IpProtocol: tcp
+        Description: "MSK access from Lambda while using No Auth"
+        FromPort: 9094
+        ToPort: 9094
+        SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      - IpProtocol: tcp
+        Description: "MSK access from Kafka Client Instance while using SASL/SCRAM"
+        FromPort: 9096
+        ToPort: 9096
+        SourceSecurityGroupId: !Ref KafkaClientInstanceSecurityGroup
+      - IpProtocol: tcp
+        Description: "MSK access from Lambda while using SASL/SCRAM"
+        FromPort: 9096
+        ToPort: 9096
+        SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  MSKCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      BrokerNodeGroupInfo:
+        ClientSubnets:
+          - !Ref MSKVPCPrivateSubnet1
+          - !Ref MSKVPCPrivateSubnet2
+        InstanceType: kafka.m5.large
+        SecurityGroups: [!GetAtt MSKSecurityGroup.GroupId]
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: 100
+      ClusterName: !Join
+                    - "-"
+                    - - !Ref "AWS::StackName"
+                      - "MSKCluster"
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+      ClientAuthentication:
+        Sasl:
+          Scram:
+            Enabled: true
+        Unauthenticated:
+          Enabled: true
+      EnhancedMonitoring: DEFAULT
+      KafkaVersion: 2.8.1
+      NumberOfBrokerNodes: 2
+
+  Cloud9EC2Bastion:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties: 
+      AutomaticStopTimeMinutes: 600
+      Description: Cloud9 EC2 environment
+      InstanceType: m5.large
+      Name: !Sub ${AWS::StackName}-Cloud9EC2Bastion
+      SubnetId: !Ref MSKVPCPublicSubnet1
+      Tags: 
+        - Key: "Purpose"
+          Value: "Cloud9EC2BastionHostInstance"
+
+  KafkaClientEC2Instance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: m5.large
+      KeyName: !Ref "KeyName"
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      AvailabilityZone: 
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: {Ref: "AWS::Region"}
+      SubnetId: !Ref MSKVPCPrivateSubnet1
+      SecurityGroupIds: [!GetAtt KafkaClientInstanceSecurityGroup.GroupId]
+      ImageId: !Ref LatestAmiId
+      Tags:
+        - Key: "Name"
+          Value: !Sub ${AWS::StackName}-KafkaClientInstance1
+      UserData: 
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install java-1.8.0-openjdk-devel -y
+
+            cd  /home/ec2-user
+            #Downlaod sample customer data
+            su -c "wget https://raw.githubusercontent.com/srakshit/cross-account-lambda-msk-blog/main/customer_data.json" -s /bin/sh ec2-user
+
+            # Create dirs, get Apache Kafka 2.8.1
+            su -c "mkdir -p kafka281" -s /bin/sh ec2-user
+            ln -s /home/ec2-user/kafka281 /home/ec2-user/kafka
+            cd kafka
+            su -c "wget https://archive.apache.org/dist/kafka/2.8.1/kafka_2.12-2.8.1.tgz" -s /bin/sh ec2-user
+            su -c "tar -xzf kafka_2.12-2.8.1.tgz --strip 1" -s /bin/sh ec2-user
+
+  KafkaClientEC2InstancePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: KafkaClientEC2InstancePolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - kafka-cluster:Connect
+              - kafka-cluster:AlterCluster
+              - kafka-cluster:DescribeCluster
+              - kafka-cluster:DescribeClusterDynamicConfiguration
+            Resource: !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:cluster/*"
+          - Effect: Allow
+            Action:
+              - kafka-cluster:*Topic*
+              - kafka-cluster:WriteData
+              - kafka-cluster:ReadData
+            Resource: !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/*"
+          - Effect: Allow
+            Action:
+              - kafka-cluster:AlterGroup
+              - kafka-cluster:DescribeGroup
+            Resource: !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:group/*"
+          - Effect: Allow
+            Action:
+              - secretsmanager:ListSecrets
+              - secretsmanager:GetSecretValue
+              - kafka:BatchAssociateScramSecret
+              - kafka:BatchDisassociateScramSecret
+            Resource: "*"
+      Roles:
+        - !Ref EC2Role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: !Join
+                            - "-"
+                            - - "EC2MMMSKCFProfile"
+                              - !Ref "AWS::StackName"
+      Roles:
+        - !Ref EC2Role
+
+  EC2Role: 
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: An symmetric encryption KMS key used for MSK SASL/SCRAM authn
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-cmk-saslscram-policy
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EC2Role.Arn
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: "*"
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS: 
+                - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/kafka.amazonaws.com/AWSServiceRoleForKafka"
+                - !GetAtt EC2Role.Arn
+            Action:
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+            Resource: "*"
+          - Sid: Allow attachment of persistent resources
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/kafka.amazonaws.com/AWSServiceRoleForKafka"
+            Action:
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:RevokeGrant
+            Resource: "*"
+            Condition:
+              Bool: 
+                kms:GrantIsForAWSResource: true
+  
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties: 
+      AliasName: alias/saslscram-msk
+      TargetKeyId: !Ref KMSKey
+
+  MSKConsumerLambdaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: AmazonMSK_LambdaConsumer
+      Description: This secret has a dynamically generated secret password.
+      KmsKeyId: !Ref KMSKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "msk-lambda-consumer"}'
+        GenerateStringKey: "password"
+        PasswordLength: 10
+        ExcludePunctuation: true
+  
+  MSKConsumerLambdaSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      BlockPublicPolicy: True
+      SecretId: !Ref MSKConsumerLambdaSecret
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Resource: !Ref MSKConsumerLambdaSecret
+          Action: secretsmanager:GetSecretValue
+          Effect: Allow
+          Principal:
+            Service: kafka.amazonaws.com
+            AWS: !GetAtt EC2Role.Arn
+
+  MSKProducerSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: AmazonMSK_Producer
+      Description: This secret has a dynamically generated secret password.
+      KmsKeyId: !Ref KMSKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "msk-producer"}'
+        GenerateStringKey: "password"
+        PasswordLength: 10
+        ExcludePunctuation: true
+  
+  MSKProducerSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      BlockPublicPolicy: True
+      SecretId: !Ref MSKProducerSecret
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Resource: !Ref MSKProducerSecret
+          Action: secretsmanager:GetSecretValue
+          Effect: Allow
+          Principal:
+            Service: kafka.amazonaws.com
+            AWS: !GetAtt EC2Role.Arn
+  
+  MSKAssociateScramSecret:
+    Type: AWS::MSK::BatchScramSecret
+    Properties: 
+      ClusterArn: !Ref MSKCluster
+      SecretArnList: 
+        - !Ref MSKProducerSecret
+        - !Ref MSKConsumerLambdaSecret
+
+Outputs:
+  MSKVPC:
+    Description: VPC in which Amazon MSK will be deployed
+    Value: !Ref MSKVPC
+  VPCPeeringConnectionId:
+    Description: VPC Peering Connection Id
+    Value: !Ref VPCPeeringConnection
+  MSKClusterArn:
+    Description: The Arn for the Destination MSK cluster
+    Value: !Ref MSKCluster
+  KafkaClientEC2InstanceSecurityGroupId:
+    Description: The security group id for the EC2 instance
+    Value: !GetAtt KafkaClientInstanceSecurityGroup.GroupId
+  MSKClusterSecurityGroupId:
+    Description: The security group id for the Amazon MSK cluster
+    Value: !GetAtt MSKSecurityGroup.GroupId
+  SSHKafkaClientEC2Instance1:
+    Description: SSH command for Kafka the EC2 instance1
+    Value: !Sub ssh -A ec2-user@${KafkaClientEC2Instance1.PrivateDnsName}
+  Cloud9IDE:
+    Value:
+      Fn::Join:
+      - ''
+      - - https://
+        - Ref: AWS::Region
+        - ".console.aws.amazon.com/cloud9/ide/"
+        - Ref: Cloud9EC2Bastion
+        - "?region="
+        - Ref: AWS::Region
+  SASLSCRAMKMSKey:
+    Value: !Ref KMSKey
+  MSKConsumerLambdaSecretArn:
+    Value: !Ref MSKConsumerLambdaSecret
+  MSKProducerSecretArn:
+    Value: !Ref MSKProducerSecret
+
+

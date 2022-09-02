@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create Lambda VPC, provision Lambda along with an assumable role for cross account VPC peering.
+Parameters:
+  MSKAccountId:
+    Description: AWS AccountId where MSK would be provisoned
+    Type: String
+    AllowedPattern: ^([0-9]{12})$
+Resources:
+  LambdaVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.16.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: LambdaVPC
+  
+  VPCPeerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Principal:
+              AWS: !Ref MSKAccountId
+            Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'ec2:AcceptVpcPeeringConnection'
+                Resource: '*'
+
+  LambdaVPCPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LambdaVPC
+      AvailabilityZone:
+        Fn::Select:
+         - 0
+         - Fn::GetAZs: {Ref: "AWS::Region"}
+      CidrBlock: 172.16.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["LambdaVPC","public-subnet"]]
+
+  LambdaVPCPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LambdaVPC
+      AvailabilityZone:
+        Fn::Select:
+         - 0
+         - Fn::GetAZs: {Ref: "AWS::Region"}
+      CidrBlock: 172.16.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["LambdaVPC","private-subnet-a"]]
+
+  LambdaVPCPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LambdaVPC
+      AvailabilityZone:
+        Fn::Select:
+         - 1
+         - Fn::GetAZs: {Ref: "AWS::Region"}
+      CidrBlock: 172.16.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["LambdaVPC","private-subnet-b"]]
+
+  LambdaVPCInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["LambdaVPC","gateway"]]
+
+  LambdaVPCGatewayToInternet:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LambdaVPC
+      InternetGatewayId: !Ref LambdaVPCInternetGateway
+
+  LambdaVPCPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LambdaVPC
+
+  LambdaVPCPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: LambdaVPCGatewayToInternet
+    Properties:
+      RouteTableId: !Ref LambdaVPCPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref LambdaVPCInternetGateway
+
+  LambdaVPCPublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LambdaVPCPublicSubnet1
+      RouteTableId: !Ref LambdaVPCPublicRouteTable
+
+  LambdaVPCNatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: LambdaVPCNatPublicIP
+    Properties:
+      AllocationId: !GetAtt LambdaVPCNatPublicIP.AllocationId
+      SubnetId: !Ref LambdaVPCPublicSubnet1
+
+  LambdaVPCNatPublicIP:
+    Type: AWS::EC2::EIP
+    DependsOn: LambdaVPC
+    Properties:
+      Domain: vpc
+
+  LambdaVPCPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LambdaVPC
+
+  LambdaVPCPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref LambdaVPCPrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref LambdaVPCNatGateway
+
+  LambdaVPCPrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LambdaVPCPrivateSubnet1
+      RouteTableId: !Ref LambdaVPCPrivateRouteTable
+
+  LambdaVPCPrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LambdaVPCPrivateSubnet2
+      RouteTableId: !Ref LambdaVPCPrivateRouteTable
+
+  LambdaConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: "lambda-logs"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:Describe*"
+                  - "ec2:List*"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - "arn:aws:logs:*:*:*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaMSKExecutionRole
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda to use this group to access MSK cluster
+      VpcId: !Ref LambdaVPC
+
+  LambdaConsumer:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Lambda Consumer of MSK
+      Runtime: python3.9
+      FunctionName: msk-lambda-cross-account-sasl-scram
+      Handler: index.handler
+      Role: !GetAtt LambdaConsumerRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import base64
+
+          def handler(event, context):
+              # Iterate over events
+              for partition_key, partition_values in event['records'].items():
+                  for record_value in partition_values:
+                      data = base64.b64decode(record_value['value'])
+                      data = data.decode("utf-8")
+                      print(data)
+
+Outputs:
+  LambdaVPCId:
+    Description: VPC in which AWS Lambda function would be deployed
+    Value: !Ref LambdaVPC
+  LambdaVPCPrivateRouteTable:
+    Description: Route table associated with private subnets of Lambda VPC
+    Value: !Ref LambdaVPCPrivateRouteTable
+  VPCPeeringRoleARN:
+    Description: Arn of the role used for VPC peering
+    Value: !GetAtt 
+      - VPCPeerRole
+      - Arn
+  LambdaArn:
+    Description: Arn of Lambda Consumer
+    Value: !GetAtt
+      - LambdaConsumer
+      - Arn
+  LambdaSecurityGroup:
+    Description: Lambda Security Group
+    Value: !Ref LambdaSecurityGroup
+  LambdaVPCAccountId:
+    Description: AWS Account Id
+    Value: !Ref AWS::AccountId
+
+
+
